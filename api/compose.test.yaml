@@ -1,0 +1,19 @@
+services:
+  mysql:
+    image: mysql:8.4.13
+    environment:
+      MYSQL_ROOT_PASSWORD: ${FECHOU_TEST_DB_ROOT_PASSWORD:?Set a generated test-only root password}
+      MYSQL_DATABASE: fechou_test
+      MYSQL_USER: fechou_test
+      MYSQL_PASSWORD: ${TEST_MYSQL_PASSWORD:?Set a generated TEST_MYSQL_PASSWORD}
+    ports:
+      - "127.0.0.1:${FECHOU_TEST_MYSQL_PORT:?Set a free loopback-only test port}:3306"
+    tmpfs:
+      - /var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping --host=127.0.0.1 --silent"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 20s
+    restart: "no"
