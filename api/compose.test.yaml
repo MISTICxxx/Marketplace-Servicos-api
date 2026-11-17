@@ -1,6 +1,7 @@
 services:
   mysql:
     image: mysql:8.4.13
+    command: ["--skip-log-bin"]
     environment:
       MYSQL_ROOT_PASSWORD: ${FECHOU_TEST_DB_ROOT_PASSWORD:?Set a generated test-only root password}
       MYSQL_DATABASE: fechou_test

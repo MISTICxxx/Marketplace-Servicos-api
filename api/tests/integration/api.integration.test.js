@@ -137,6 +137,18 @@ function requestPayload(title) {
   }
 }
 
+function quotePayload(amountCents, description = 'Serviço com materiais e execução detalhados.') {
+  return {
+    amountCents,
+    description,
+    includedItems: ['Mão de obra', 'Materiais básicos'],
+    excludedItems: ['Pintura de acabamento'],
+    estimatedDays: 3,
+    conditions: 'Pagamento combinado diretamente após a conclusão do serviço.',
+    validUntil: new Date(Date.now() + 5 * 24 * 60 * 60 * 1000).toISOString(),
+  }
+}
+
 async function waitForRestartedApi(child, url) {
   for (let attempt = 0; attempt < 120; attempt += 1) {
     if (child.exitCode !== null) throw new Error('A API reiniciada encerrou antes do health check.')
@@ -177,6 +189,20 @@ before(async () => {
   server = app.listen(0, '127.0.0.1')
   await once(server, 'listening')
   baseUrl = `http://127.0.0.1:${server.address().port}`
+})
+
+test('migrations têm versão registrada e podem ser repetidas sem reaplicar DDL', async () => {
+  const [rows] = await db.execute('SELECT version,checksum FROM schema_migrations ORDER BY version')
+  assert.deepEqual(rows.map((row) => row.version), [
+    '0001-initial-schema.js',
+    '0002-request-contracted-status.js',
+    '0003-quotes-and-versions.js',
+    '0004-service-orders.js',
+  ])
+  assert.match(rows[0].checksum, /^[a-f0-9]{64}$/)
+  assert.deepEqual(await initializeDatabase(), [])
+  const [afterReplay] = await db.execute('SELECT version,checksum FROM schema_migrations ORDER BY version')
+  assert.deepEqual(afterReplay, rows)
 })
 
 after(async () => {
@@ -527,6 +553,205 @@ test('autenticação, perfil, solicitações e conversas persistem sob regras de
     const markedRead = await call('POST', `/conversations/${fixtures.conversationA.id}/read`, { token: fixtures.customerA.token })
     assert.equal(markedRead.status, 200)
     assert.ok(markedRead.body.conversation.messages[1].readAt)
+
+    const noAuthQuotes = await call('GET', `/requests/${fixtures.requestA.id}/quotes`)
+    assert.equal(noAuthQuotes.status, 401)
+    const wrongRoleCreate = await call('POST', `/conversations/${fixtures.conversationA.id}/quotes`, {
+      token: fixtures.customerA.token,
+      body: { title: 'Opção inválida', ...quotePayload(12000) },
+    })
+    assert.equal(wrongRoleCreate.status, 403)
+    const differentProviderCreate = await call('POST', `/conversations/${fixtures.conversationA.id}/quotes`, {
+      token: fixtures.providerB.token,
+      body: { title: 'Tentativa externa', ...quotePayload(12000) },
+    })
+    assert.equal(differentProviderCreate.status, 404)
+    const invalidQuote = await call('POST', `/conversations/${fixtures.conversationA.id}/quotes`, {
+      token: fixtures.providerA.token,
+      body: { title: 'Preço inválido', ...quotePayload(0) },
+    })
+    assert.equal(invalidQuote.status, 400)
+
+    const createdFirst = await call('POST', `/conversations/${fixtures.conversationA.id}/quotes`, {
+      token: fixtures.providerA.token,
+      body: { title: 'Opção econômica', ...quotePayload(18500) },
+    })
+    assert.equal(createdFirst.status, 201)
+    fixtures.quoteA = createdFirst.body.quote
+    const firstVersionId = fixtures.quoteA.currentVersion.id
+
+    const revised = await call('POST', `/quotes/${fixtures.quoteA.id}/versions`, {
+      token: fixtures.providerA.token,
+      body: quotePayload(20500, 'Serviço revisado com substituição de componentes incluída.'),
+    })
+    assert.equal(revised.status, 201)
+    fixtures.quoteA = revised.body.quote
+    assert.equal(fixtures.quoteA.currentVersion.versionNumber, 2)
+    assert.notEqual(fixtures.quoteA.currentVersion.id, firstVersionId)
+
+    await assert.rejects(
+      db.execute('UPDATE quote_versions SET amount_cents=amount_cents+1 WHERE id=?', [firstVersionId]),
+      /immutable|Quote versions/i,
+      'trigger do MySQL impede alteração de versão existente',
+    )
+
+    const secondOption = await call('POST', `/conversations/${fixtures.conversationA.id}/quotes`, {
+      token: fixtures.providerA.token,
+      body: { title: 'Opção completa', ...quotePayload(32000, 'Serviço completo com revisão e garantia descrita.') },
+    })
+    assert.equal(secondOption.status, 201)
+    fixtures.quoteAlternative = secondOption.body.quote
+
+    const differentProviderOption = await call('POST', `/conversations/${fixtures.conversationB.id}/quotes`, {
+      token: fixtures.providerB.token,
+      body: { title: 'Opção especializada', ...quotePayload(27500, 'Serviço especializado com peças e visita técnica.') },
+    })
+    assert.equal(differentProviderOption.status, 201)
+    fixtures.quoteOtherProvider = differentProviderOption.body.quote
+
+    const requestQuotes = await call('GET', `/requests/${fixtures.requestA.id}/quotes`, { token: fixtures.customerA.token })
+    assert.equal(requestQuotes.status, 200)
+    assert.equal(requestQuotes.body.data.length, 3)
+    const providerQuotes = await call('GET', `/requests/${fixtures.requestA.id}/quotes`, { token: fixtures.providerA.token })
+    assert.equal(providerQuotes.status, 200)
+    assert.equal(providerQuotes.body.data.length, 2)
+    assert.ok(providerQuotes.body.data.every((quote) => quote.providerId === fixtures.providerA.id))
+    const foreignQuotes = await call('GET', `/requests/${fixtures.requestA.id}/quotes`, { token: fixtures.customerB.token })
+    assert.equal(foreignQuotes.status, 404)
+    const foreignQuote = await call('GET', `/quotes/${fixtures.quoteA.id}`, { token: fixtures.customerB.token })
+    assert.equal(foreignQuote.status, 404)
+    const foreignConversationQuotes = await call('GET', `/conversations/${fixtures.conversationA.id}/quotes`, { token: fixtures.customerB.token })
+    assert.equal(foreignConversationQuotes.status, 404)
+    assert.equal('email' in requestQuotes.body.data[0], false)
+    assert.equal('password_hash' in requestQuotes.body.data[0], false)
+    const versions = await call('GET', `/quotes/${fixtures.quoteA.id}/versions`, { token: fixtures.customerA.token })
+    assert.equal(versions.status, 200)
+    assert.deepEqual(versions.body.data.map((version) => version.versionNumber), [1, 2])
+    assert.equal(versions.body.data[0].amountCents, 18500)
+    assert.equal(versions.body.data[1].amountCents, 20500)
+
+    const withdrawn = await call('POST', `/quotes/${fixtures.quoteOtherProvider.id}/withdraw`, { token: fixtures.providerB.token })
+    assert.equal(withdrawn.status, 200)
+    assert.equal(withdrawn.body.quote.status, 'withdrawn')
+    const withdrawnAccept = await call('POST', `/quotes/${fixtures.quoteOtherProvider.id}/accept`, {
+      token: fixtures.customerA.token,
+      body: { versionId: fixtures.quoteOtherProvider.currentVersion.id },
+    })
+    assert.equal(withdrawnAccept.status, 409)
+
+    const staleAccept = await call('POST', `/quotes/${fixtures.quoteA.id}/accept`, {
+      token: fixtures.customerA.token,
+      body: { versionId: firstVersionId },
+    })
+    assert.equal(staleAccept.status, 409)
+    const providerAccept = await call('POST', `/quotes/${fixtures.quoteA.id}/accept`, {
+      token: fixtures.providerA.token,
+      body: { versionId: fixtures.quoteA.currentVersion.id },
+    })
+    assert.equal(providerAccept.status, 403)
+    const otherProviderRevision = await call('POST', `/quotes/${fixtures.quoteA.id}/versions`, {
+      token: fixtures.providerB.token,
+      body: quotePayload(22000),
+    })
+    assert.equal(otherProviderRevision.status, 404)
+
+    const accepted = await call('POST', `/quotes/${fixtures.quoteA.id}/accept`, {
+      token: fixtures.customerA.token,
+      body: { versionId: fixtures.quoteA.currentVersion.id },
+    })
+    assert.equal(accepted.status, 201)
+    fixtures.orderA = accepted.body.order
+    assert.equal(fixtures.orderA.status, 'contracted')
+    assert.equal(fixtures.orderA.quoteVersionId, fixtures.quoteA.currentVersion.id)
+    assert.equal(fixtures.orderA.amountCents, 20500)
+    assert.equal(fixtures.orderA.versionNumber, 2)
+    assert.equal(accepted.body.created, true)
+    const idempotentAccept = await call('POST', `/quotes/${fixtures.quoteA.id}/accept`, {
+      token: fixtures.customerA.token,
+      body: { versionId: fixtures.quoteA.currentVersion.id },
+    })
+    assert.equal(idempotentAccept.status, 200)
+    assert.equal(idempotentAccept.body.created, false)
+    assert.equal(idempotentAccept.body.order.id, fixtures.orderA.id)
+
+    const requestAfterAccept = await call('GET', `/requests/${fixtures.requestA.id}`, { token: fixtures.customerA.token })
+    assert.equal(requestAfterAccept.body.request.status, 'contracted')
+    assert.ok(requestAfterAccept.body.request.history.some((entry) => entry.event === 'contracted'))
+    const quoteAfterAccept = await call('GET', `/quotes/${fixtures.quoteAlternative.id}`, { token: fixtures.customerA.token })
+    assert.equal(quoteAfterAccept.body.quote.status, 'closed')
+    const rejectedOtherQuote = await call('POST', `/quotes/${fixtures.quoteAlternative.id}/accept`, {
+      token: fixtures.customerA.token,
+      body: { versionId: fixtures.quoteAlternative.currentVersion.id },
+    })
+    assert.equal(rejectedOtherQuote.status, 409)
+
+    const ownerOrders = await call('GET', `/service-orders?requestId=${fixtures.requestA.id}`, { token: fixtures.customerA.token })
+    assert.equal(ownerOrders.status, 200)
+    assert.equal(ownerOrders.body.data.length, 1)
+    assert.equal(ownerOrders.body.data[0].id, fixtures.orderA.id)
+    const providerOrders = await call('GET', '/service-orders', { token: fixtures.providerA.token })
+    assert.ok(providerOrders.body.data.some((order) => order.id === fixtures.orderA.id))
+    const outsiderOrders = await call('GET', `/service-orders/${fixtures.orderA.id}`, { token: fixtures.customerB.token })
+    assert.equal(outsiderOrders.status, 404)
+    const orderDetail = await call('GET', `/service-orders/${fixtures.orderA.id}`, { token: fixtures.providerA.token })
+    assert.equal(orderDetail.status, 200)
+    assert.equal(orderDetail.body.order.amountCents, 20500)
+
+    const postContractMessage = await call('POST', `/conversations/${fixtures.conversationA.id}/messages`, {
+      token: fixtures.providerA.token,
+      body: { text: 'Mensagem sobre a execução após a contratação.' },
+    })
+    assert.equal(postContractMessage.status, 201)
+
+    const contractedEdit = await call('PATCH', `/requests/${fixtures.requestA.id}`, {
+      token: fixtures.customerA.token,
+      body: requestPayload(`Tentativa de editar pedido contratado ${runId}`),
+    })
+    assert.equal(contractedEdit.status, 409)
+
+    const [conversationA, conversationB] = await Promise.all([
+      call('POST', '/conversations', { token: fixtures.customerB.token, body: { requestId: fixtures.requestB.id, providerId: fixtures.providerA.id } }),
+      call('POST', '/conversations', { token: fixtures.customerB.token, body: { requestId: fixtures.requestB.id, providerId: fixtures.providerB.id } }),
+    ])
+    assert.equal(conversationA.status, 201)
+    assert.equal(conversationB.status, 201)
+    const [quoteA, quoteB] = await Promise.all([
+      call('POST', `/conversations/${conversationA.body.conversation.id}/quotes`, { token: fixtures.providerA.token, body: { title: 'Concorrente A', ...quotePayload(14000) } }),
+      call('POST', `/conversations/${conversationB.body.conversation.id}/quotes`, { token: fixtures.providerB.token, body: { title: 'Concorrente B', ...quotePayload(16000) } }),
+    ])
+    assert.equal(quoteA.status, 201)
+    assert.equal(quoteB.status, 201)
+    const concurrentResults = await Promise.all([
+      call('POST', `/quotes/${quoteA.body.quote.id}/accept`, { token: fixtures.customerB.token, body: { versionId: quoteA.body.quote.currentVersion.id } }),
+      call('POST', `/quotes/${quoteB.body.quote.id}/accept`, { token: fixtures.customerB.token, body: { versionId: quoteB.body.quote.currentVersion.id } }),
+    ])
+    assert.deepEqual(concurrentResults.map((result) => result.status).sort(), [201, 409])
+    const [concurrentOrders] = await db.execute('SELECT id,quote_id AS quoteId,quote_version_id AS versionId FROM service_orders WHERE request_id=?', [fixtures.requestB.id])
+    assert.equal(concurrentOrders.length, 1)
+    assert.ok([quoteA.body.quote, quoteB.body.quote].some((quote) => quote.id === concurrentOrders[0].quoteId && quote.currentVersion.id === concurrentOrders[0].versionId))
+    fixtures.orderB = concurrentOrders[0]
+
+    const cancelledCandidate = await call('POST', '/requests', {
+      token: fixtures.customerB.token,
+      body: requestPayload(`Pedido cancelado após proposta ${runId}`),
+    })
+    assert.equal(cancelledCandidate.status, 201)
+    const cancelledConversationId = randomUUID()
+    const cancelledNow = new Date().toISOString()
+    await db.execute('INSERT INTO conversations(id,request_id,owner_id,provider_id,created_at,updated_at) VALUES(?,?,?,?,?,?)', [
+      cancelledConversationId, cancelledCandidate.body.request.id, fixtures.customerB.id, fixtures.providerA.id, cancelledNow, cancelledNow,
+    ])
+    const cancelledQuote = await call('POST', `/conversations/${cancelledConversationId}/quotes`, {
+      token: fixtures.providerA.token,
+      body: { title: 'Orçamento para teste de cancelamento', ...quotePayload(19500) },
+    })
+    assert.equal(cancelledQuote.status, 201)
+    await db.execute("UPDATE service_requests SET status='cancelled' WHERE id=?", [cancelledCandidate.body.request.id])
+    const acceptCancelled = await call('POST', `/quotes/${cancelledQuote.body.quote.id}/accept`, {
+      token: fixtures.customerB.token,
+      body: { versionId: cancelledQuote.body.quote.currentVersion.id },
+    })
+    assert.equal(acceptCancelled.status, 409)
   })
 
   await t.test('a persistência sobrevive ao encerramento e à inicialização normal da API', async () => {
@@ -562,8 +787,16 @@ test('autenticação, perfil, solicitações e conversas persistem sob regras de
 
     const savedConversation = await call('GET', `/conversations/${fixtures.conversationA.id}`, { token: fixtures.customerA.token })
     assert.equal(savedConversation.status, 200)
-    assert.equal(savedConversation.body.conversation.messages.length, 2)
+    assert.equal(savedConversation.body.conversation.messages.length, 3)
     assert.equal(savedConversation.body.conversation.messages[0].text, 'Mensagem fictícia do cliente.')
     assert.equal(savedConversation.body.conversation.messages[1].text, 'Resposta fictícia do prestador.')
+    assert.equal(savedConversation.body.conversation.messages[2].text, 'Mensagem sobre a execução após a contratação.')
+
+    const savedOrder = await call('GET', `/service-orders/${fixtures.orderA.id}`, { token: fixtures.customerA.token })
+    assert.equal(savedOrder.status, 200)
+    assert.equal(savedOrder.body.order.quoteVersionId, fixtures.quoteA.currentVersion.id)
+    assert.equal(savedOrder.body.order.amountCents, 20500)
+    const savedContractedRequest = await call('GET', `/requests/${fixtures.requestA.id}`, { token: fixtures.customerA.token })
+    assert.equal(savedContractedRequest.body.request.status, 'contracted')
   })
 })
