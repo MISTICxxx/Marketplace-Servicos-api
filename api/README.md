@@ -2,21 +2,25 @@
 
 API REST em Node.js/Express com persistência MySQL. Contas, perfis de prestadores, pedidos, histórico, conversas e mensagens ficam no banco. Senhas são armazenadas com hash bcrypt; rotas privadas exigem JWT.
 
-## Requisitos e inicialização
+## Requisitos e ambiente local
 
-- Node.js 20.19+ e MySQL 8+.
-- Crie o banco uma vez no MySQL: `CREATE DATABASE fechou CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;`.
-- Na pasta `api`, instale as dependências, copie `.env.example` para `.env`, ajuste os dados de conexão e defina um `JWT_SECRET` aleatório com pelo menos 32 caracteres:
+- Node.js 20.19+, Docker e Docker Compose.
+- Na pasta `api`, instale dependências com `npm ci` e prepare o arquivo local ignorado `api/.env` a partir de `.env.example`. Substitua os valores demonstrativos de senha e `JWT_SECRET` por valores aleatórios locais com pelo menos 32 caracteres.
+- O Compose inicia um MySQL 8.4.13 persistente em loopback e usa o volume nomeado `fechou_dev_mysql_data`.
 
 ```powershell
-npm install
-Copy-Item .env.example .env
-npm run dev
+docker compose -f compose.dev.yaml up -d --wait
+npm run db:migrate
+npm run db:status
+npm run db:seed:demo
+npm start
 ```
 
-As tabelas são criadas automaticamente ao iniciar. A API fica em `http://localhost:3001`; o health check é `GET /health` ou `GET /api/health`. `MYSQL_HOST`, `MYSQL_PORT`, `MYSQL_USER`, `MYSQL_PASSWORD`, `MYSQL_DATABASE` e `MYSQL_CONNECTION_LIMIT` configuram a conexão.
+A API fica em `http://127.0.0.1:3001` e o health check em `GET /api/health`. O servidor não executa DDL ao iniciar. Aplique mudanças apenas com `npm run db:migrate`; migrations ordenadas e seus checksums ficam registrados em `schema_migrations`. Consulte o estado com `npm run db:status`.
 
-Configure `CORS_ORIGIN` com a origem do frontend; origens múltiplas podem ser separadas por vírgula. Para o Vite local, use `http://localhost:5173`. Em produção, use HTTPS, credenciais fortes, backups do MySQL e acesso restrito ao banco.
+Para pausar preservando os dados, use `docker compose -f compose.dev.yaml stop`. Para voltar, use `docker compose -f compose.dev.yaml up -d --wait`. Não use `down -v` na rotina de desenvolvimento. O container e o volume de testes são separados do banco permanente.
+
+O seed é explícito, só aceita o banco de desenvolvimento local `fechou_dev` e não apaga registros. Use `npm run db:demo:credentials` para consultar no terminal local as contas fictícias e a senha compartilhada, definida somente em `.env`. O endereço do frontend precisa ser incluído em `CORS_ORIGIN`; no workspace, a origem configurada é `http://127.0.0.1:5174`. Em ambientes públicos, use HTTPS, credenciais fortes, backups e acesso restrito ao banco.
 
 ## Testes automatizados
 
@@ -52,9 +56,9 @@ finally {
 }
 ```
 
-O nome do projeto Compose deve ser exclusivo da execução. Não conecte a suíte a um MySQL local existente. A aplicação executa `CREATE TABLE IF NOT EXISTS` em `server.js`; a suíte de integração só faz isso depois de validar o destino. Os testes usam contas fictícias e IDs aleatórios. Não removem dados nem executam `DROP DATABASE`; a limpeza do estado de teste ocorre ao encerrar o container descartável. Não use `docker compose down -v`.
+O nome do projeto Compose deve ser exclusivo da execução. Não conecte a suíte a um MySQL local existente. O servidor HTTP não executa DDL; a suíte chama explicitamente as migrations somente depois de validar host, porta, schema, usuário e versão do servidor. Os testes usam contas fictícias e IDs aleatórios. Não removem dados nem executam `DROP DATABASE`; a limpeza do estado de teste ocorre ao encerrar o container descartável. Não use `docker compose down -v`.
 
-Os testes cobrem autenticação, perfis, propriedade das solicitações, autorização de `/requests/open`, conversas, mensagens, participantes e persistência depois de reiniciar o processo da API. O teste de integração deve ser executado separadamente da suíte sem banco.
+Os testes cobrem autenticação, perfis, propriedade das solicitações, autorização de `/requests/open`, conversas, mensagens, orçamentos, versões imutáveis, aceite concorrente e persistência depois de reiniciar o processo da API. O teste de integração deve ser executado separadamente da suíte sem banco.
 
 ## Endpoints
 
@@ -74,7 +78,7 @@ Todas as respostas usam JSON. Erros seguem `{ "error": "...", "details"?: [...] 
 | GET | `/api/providers/categories` | público | IDs de categorias aceitas |
 | GET/PUT | `/api/providers/me` | prestador | Consulta e atualiza perfil, categorias, bairros e serviços |
 | GET | `/api/requests` | autenticado | Pedidos próprios |
-| GET | `/api/requests/open` | autenticado | Pedidos abertos no marketplace |
+| GET | `/api/requests/open` | prestador autenticado | Pedidos abertos no marketplace |
 | POST | `/api/requests` | cliente | Cria pedido |
 | GET/PATCH | `/api/requests/:id` | dono (GET também prestador para pedidos abertos) | Consulta e edita pedido aberto |
 | POST | `/api/requests/:id/cancel` | dono | Cancela pedido preservando histórico |
@@ -83,11 +87,23 @@ Todas as respostas usam JSON. Erros seguem `{ "error": "...", "details"?: [...] 
 | GET | `/api/conversations/:id` | participante | Conversa e mensagens |
 | POST | `/api/conversations/:id/messages` | participante | Envia `{ text }` |
 | POST | `/api/conversations/:id/read` | participante | Marca mensagens recebidas como lidas |
+| GET | `/api/requests/:requestId/quotes` | cliente dono; prestador com conversa vinculada | Lista propostas para comparação |
+| GET | `/api/conversations/:conversationId/quotes` | participante | Lista propostas da conversa |
+| POST | `/api/conversations/:conversationId/quotes` | prestador da conversa | Cria uma alternativa e sua versão inicial |
+| GET | `/api/quotes/:quoteId` | cliente dono ou prestador responsável | Consulta proposta vigente |
+| GET | `/api/quotes/:quoteId/versions` | cliente dono ou prestador responsável | Consulta histórico de versões |
+| POST | `/api/quotes/:quoteId/versions` | prestador responsável | Emite nova versão sem alterar anteriores |
+| POST | `/api/quotes/:quoteId/withdraw` | prestador responsável | Retira proposta ativa |
+| POST | `/api/quotes/:quoteId/accept` | cliente dono | Aceita `{ versionId }` e cria ordem de serviço |
+| GET | `/api/service-orders` | participante | Lista ordens próprias; filtro opcional `requestId` |
+| GET | `/api/service-orders/:orderId` | cliente ou prestador participante | Consulta snapshot da contratação |
 
 `GET /api/providers/me` retorna o perfil próprio, incluindo `active` como booleano, mesmo quando inativo. Retorna 404 quando não há linha de perfil para o prestador autenticado. A resposta não inclui e-mail ou campos de senha. A listagem e o detalhe públicos continuam filtrando `active=1` e não expõem o campo `active`.
+
+Orçamentos armazenam valores em centavos inteiros. Cada revisão cria uma linha imutável em `quote_versions`; triggers MySQL bloqueiam atualizações e remoções. O aceite valida a versão vigente dentro de transação, limita a uma contratação por solicitação e retorna a ordem já criada em uma repetição idempotente do mesmo aceite. A ordem preserva o snapshot de título, valor, escopo, prazo e condições da versão aceita. O chat não vale como aceite. Não há processamento de pagamentos.
 
 Campos de pedido: `title`, `categoryId`, `description`, `city`, `region` e opcionais `neighborhood`, `desiredDate` (AAAA-MM-DD), `availability`, `budgetMin`, `budgetMax`, `prefersProposals`. Categorias: `eletrica`, `hidraulica`, `limpeza`, `montagem-moveis`, `pintura`, `jardinagem`, `reparos`, `outros`.
 
 ## Integração com o frontend
 
-O frontend aponta o Axios para `VITE_API_URL` (padrão `http://localhost:3001/api`) e usa os endpoints acima para cadastro, login, perfil, diretório, pedidos e conversas. A sessão JWT fica no `sessionStorage` da aba. Registros demonstrativos antigos do navegador não são migrados automaticamente; crie uma conta para começar a salvar dados no MySQL. Recuperação de senha, propostas, contratação e pagamentos ainda não estão implementados.
+O frontend aponta o Axios para `VITE_API_URL` (padrão `http://localhost:3001/api`) e usa os endpoints acima para cadastro, login, perfil, diretório, pedidos, conversas, orçamentos e ordens de serviço. A sessão JWT fica no `sessionStorage` da aba: os registros persistem no MySQL, mas fechar a aba encerra a sessão. O modelo atual exige escolher `customer` ou `provider` no cadastro. Recuperação de senha e pagamentos não estão implementados.
