@@ -61,7 +61,7 @@ router.patch('/:id', asyncRoute(async (req, res) => {
 router.post('/:id/cancel', asyncRoute(async (req, res) => {
   const current = await byId(req.params.id)
   if (!current || current.ownerId !== req.user.id) throw new HttpError(404, 'Pedido não encontrado.')
-  if (current.status !== 'open') throw new HttpError(409, 'Este pedido já está cancelado.')
+  if (current.status !== 'open') throw new HttpError(409, 'Somente pedidos abertos podem ser cancelados.')
   const now = new Date().toISOString()
   await withTransaction(async (connection) => {
     await connection.execute("UPDATE service_requests SET status='cancelled',updated_at=? WHERE id=?", [now, req.params.id])

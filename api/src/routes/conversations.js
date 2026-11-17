@@ -64,7 +64,7 @@ router.post('/:id/messages', asyncRoute(async (req, res) => {
   if (!current) throw new HttpError(404, 'Conversa não encontrada.')
   const { text } = z.object({ text: z.string().trim().min(1).max(2000) }).parse(req.body)
   const [requests] = await db.execute('SELECT status FROM service_requests WHERE id=?', [current.requestId])
-  if (requests[0]?.status !== 'open') throw new HttpError(409, 'O pedido associado não aceita novas mensagens.')
+  if (!['open', 'contracted'].includes(requests[0]?.status)) throw new HttpError(409, 'O pedido associado não aceita novas mensagens.')
   const senderType = req.user.id === current.providerId ? 'provider' : 'customer'
   const now = new Date().toISOString(), messageId = randomUUID()
   await withTransaction(async (connection) => {
