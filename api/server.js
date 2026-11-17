@@ -1,10 +1,9 @@
 import 'dotenv/config'
 import app from './src/app.js'
-import db, { initializeDatabase } from './src/config/database.js'
+import db from './src/config/database.js'
 
 const port = Number(process.env.PORT) || 3001
 const host = process.env.HOST || '0.0.0.0'
-await initializeDatabase()
 const server = app.listen(port, host, () => console.log(`Fechou API disponível em http://${host}:${port}`))
 
 function shutdown(signal) {

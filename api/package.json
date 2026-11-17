@@ -7,6 +7,10 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js",
+    "db:migrate": "node scripts/migrate.js",
+    "db:status": "node scripts/db-status.js",
+    "db:seed:demo": "node scripts/seed-demo.js",
+    "db:demo:credentials": "node scripts/show-demo-credentials.js",
     "test": "node --test tests/unit/http.test.js tests/unit/auth-middleware.test.js",
     "test:integration": "node --test tests/integration/api.integration.test.js"
   },

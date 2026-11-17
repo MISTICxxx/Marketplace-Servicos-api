@@ -1,3 +1,7 @@
+import { createHash } from 'node:crypto'
+import { readdir, readFile } from 'node:fs/promises'
+import path from 'node:path'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import mysql from 'mysql2/promise'
 
 const pool = mysql.createPool({
@@ -14,53 +18,87 @@ const pool = mysql.createPool({
   dateStrings: true,
 })
 
-export async function initializeDatabase() {
-  const statements = [
-    `CREATE TABLE IF NOT EXISTS users (
-      id CHAR(36) PRIMARY KEY, name VARCHAR(100) NOT NULL, email VARCHAR(254) NOT NULL UNIQUE,
-      password_hash VARCHAR(255) NOT NULL, role ENUM('customer','provider') NOT NULL,
-      city VARCHAR(100) NOT NULL DEFAULT '', region VARCHAR(50) NOT NULL DEFAULT '',
-      bio VARCHAR(2000) NOT NULL DEFAULT '', created_at VARCHAR(30) NOT NULL, updated_at VARCHAR(30) NOT NULL
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
-    `CREATE TABLE IF NOT EXISTS provider_profiles (
-      user_id CHAR(36) PRIMARY KEY, specialty VARCHAR(100) NOT NULL DEFAULT '',
-      summary VARCHAR(300) NOT NULL DEFAULT '', categories JSON NOT NULL,
-      neighborhoods JSON NOT NULL, services JSON NOT NULL, active TINYINT(1) NOT NULL DEFAULT 0,
-      CONSTRAINT fk_provider_user FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
-    `CREATE TABLE IF NOT EXISTS service_requests (
-      id CHAR(36) PRIMARY KEY, owner_id CHAR(36) NOT NULL, title VARCHAR(120) NOT NULL,
-      category_id VARCHAR(40) NOT NULL, description TEXT NOT NULL, city VARCHAR(100) NOT NULL,
-      region VARCHAR(50) NOT NULL, neighborhood VARCHAR(100) NULL, desired_date DATE NULL,
-      availability VARCHAR(200) NULL, budget_min DECIMAL(12,2) NULL, budget_max DECIMAL(12,2) NULL,
-      prefers_proposals TINYINT(1) NOT NULL DEFAULT 0,
-      status ENUM('open','cancelled') NOT NULL DEFAULT 'open', created_at VARCHAR(30) NOT NULL,
-      updated_at VARCHAR(30) NOT NULL, INDEX idx_requests_owner_created(owner_id,created_at),
-      CONSTRAINT fk_request_owner FOREIGN KEY(owner_id) REFERENCES users(id)
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
-    `CREATE TABLE IF NOT EXISTS request_history (
-      id CHAR(36) PRIMARY KEY, request_id CHAR(36) NOT NULL, event VARCHAR(20) NOT NULL,
-      description VARCHAR(255) NOT NULL, created_at VARCHAR(30) NOT NULL,
-      CONSTRAINT fk_history_request FOREIGN KEY(request_id) REFERENCES service_requests(id) ON DELETE CASCADE
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
-    `CREATE TABLE IF NOT EXISTS conversations (
-      id CHAR(36) PRIMARY KEY, request_id CHAR(36) NOT NULL, owner_id CHAR(36) NOT NULL,
-      provider_id CHAR(36) NOT NULL, created_at VARCHAR(30) NOT NULL, updated_at VARCHAR(30) NOT NULL,
-      last_message_at VARCHAR(30) NULL, UNIQUE KEY uq_request_provider(request_id,provider_id),
-      CONSTRAINT fk_conversation_request FOREIGN KEY(request_id) REFERENCES service_requests(id),
-      CONSTRAINT fk_conversation_owner FOREIGN KEY(owner_id) REFERENCES users(id),
-      CONSTRAINT fk_conversation_provider FOREIGN KEY(provider_id) REFERENCES users(id)
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
-    `CREATE TABLE IF NOT EXISTS messages (
-      id CHAR(36) PRIMARY KEY, conversation_id CHAR(36) NOT NULL, sender_id CHAR(36) NOT NULL,
-      sender_type ENUM('customer','provider') NOT NULL, text VARCHAR(2000) NOT NULL,
-      sent_at VARCHAR(30) NOT NULL, read_at VARCHAR(30) NULL, INDEX idx_messages_conversation(conversation_id,sent_at),
-      CONSTRAINT fk_message_conversation FOREIGN KEY(conversation_id) REFERENCES conversations(id) ON DELETE CASCADE,
-      CONSTRAINT fk_message_sender FOREIGN KEY(sender_id) REFERENCES users(id)
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`,
-  ]
-  for (const statement of statements) await pool.query(statement)
+const migrationsDirectory = fileURLToPath(new URL('../migrations/', import.meta.url))
+
+async function listMigrations() {
+  const entries = await readdir(migrationsDirectory, { withFileTypes: true })
+  const files = entries
+    .filter((entry) => entry.isFile() && /^\d{4}-[a-z0-9-]+\.js$/.test(entry.name))
+    .map((entry) => entry.name)
+    .sort()
+
+  const versions = files.map((file) => file.slice(0, 4))
+  if (new Set(versions).size !== versions.length) {
+    throw new Error('Existem versões de migration duplicadas.')
+  }
+  return files
 }
+
+export async function runMigrations() {
+  const connection = await pool.getConnection()
+  let lockAcquired = false
+
+  try {
+    const [lockRows] = await connection.execute('SELECT GET_LOCK(?, 30) AS acquired', ['fechou-schema-migrations'])
+    lockAcquired = Number(lockRows[0]?.acquired) === 1
+    if (!lockAcquired) throw new Error('Não foi possível obter o bloqueio exclusivo para migrations.')
+
+    await connection.query(`CREATE TABLE IF NOT EXISTS schema_migrations (
+      version VARCHAR(190) PRIMARY KEY,
+      checksum CHAR(64) NOT NULL,
+      applied_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci`)
+
+    const files = await listMigrations()
+    const [appliedRows] = await connection.execute('SELECT version, checksum FROM schema_migrations ORDER BY version')
+    const applied = new Map(appliedRows.map((row) => [row.version, row.checksum]))
+    const currentVersions = new Set(files)
+
+    for (const version of applied.keys()) {
+      if (!currentVersions.has(version)) {
+        throw new Error(`A migration aplicada ${version} não existe mais no diretório; execução interrompida.`)
+      }
+    }
+
+    const executed = []
+    for (const file of files) {
+      const source = await readFile(path.join(migrationsDirectory, file))
+      const checksum = createHash('sha256').update(source).digest('hex')
+      const priorChecksum = applied.get(file)
+
+      if (priorChecksum && priorChecksum !== checksum) {
+        throw new Error(`A migration aplicada ${file} foi alterada; crie uma nova migration em vez de editar o histórico.`)
+      }
+      if (priorChecksum) continue
+
+      const migration = await import(pathToFileURL(path.join(migrationsDirectory, file)).href)
+      if (typeof migration.up !== 'function') throw new Error(`A migration ${file} não exporta uma função up(connection).`)
+
+      try {
+        await migration.up(connection)
+        await connection.execute('INSERT INTO schema_migrations(version, checksum) VALUES(?, ?)', [file, checksum])
+      } catch (error) {
+        throw new Error(`A migration ${file} falhou; ela não foi registrada como aplicada. Verifique o schema antes de repetir.`, { cause: error })
+      }
+      executed.push(file)
+    }
+
+    return executed
+  } finally {
+    if (lockAcquired) {
+      try {
+        await connection.execute('SELECT RELEASE_LOCK(?)', ['fechou-schema-migrations'])
+      } catch {
+        // Fechar a conexão também libera o named lock.
+      }
+    }
+    connection.release()
+  }
+}
+
+// Mantém o nome usado pela suíte de integração existente. A função é explícita;
+// o servidor HTTP não executa DDL ao iniciar.
+export const initializeDatabase = runMigrations
 
 export async function withTransaction(work) {
   const connection = await pool.getConnection()
